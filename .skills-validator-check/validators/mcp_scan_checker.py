@@ -33,12 +33,14 @@ Exit Codes:
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
 
 # ANSI color codes
@@ -55,6 +57,84 @@ INFORMATIONAL_CODES = frozenset({
     "W004",  # "The MCP server is not in our registry" — expected for custom skills
 })
 
+# Path to per-component allowlist (relative to validators/ dir or repo root)
+_ALLOWLIST_FILENAME = "mcp-scan-allowlist.json"
+
+# Regex to extract HTTP(S) URLs from text
+_URL_RE = re.compile(r'https?://[^\s"\'<>)\]},`]+')
+
+# Domains that are always considered placeholders and excluded from validation
+_PLACEHOLDER_DOMAINS = frozenset({
+    "localhost",
+})
+
+
+def _load_allowlist(repo_root: Path) -> Tuple[
+    dict[str, frozenset[str]],
+    dict[str, frozenset[str]],
+    frozenset[str],
+]:
+    """Load per-component allowlist.
+
+    Returns:
+        (code_allowlist, domain_allowlist, placeholder_domains)
+        - code_allowlist: component path → allowed warning codes
+        - domain_allowlist: component path → allowed external domains
+        - placeholder_domains: domains to ignore during validation
+    """
+    allowlist_path = repo_root / ".skills-validator-check" / _ALLOWLIST_FILENAME
+    if not allowlist_path.exists():
+        return {}, {}, _PLACEHOLDER_DOMAINS
+
+    try:
+        data = json.loads(allowlist_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}, {}, _PLACEHOLDER_DOMAINS
+
+    # Merge file-level placeholder domains with built-in ones
+    file_placeholders = frozenset(
+        d.lower() for d in data.get("_placeholder_domains", [])
+    )
+    placeholders = _PLACEHOLDER_DOMAINS | file_placeholders
+
+    codes: dict[str, frozenset[str]] = {}
+    domains: dict[str, frozenset[str]] = {}
+    for entry in data.get("components", []):
+        path = entry.get("path", "").rstrip("/")
+        if not path:
+            continue
+        allow_codes = entry.get("allow", [])
+        if allow_codes:
+            codes[path] = frozenset(allow_codes)
+        allow_domains = entry.get("domains", [])
+        domains[path] = frozenset(d.lower() for d in allow_domains)
+    return codes, domains, placeholders
+
+
+def _extract_domains_from_files(skill_path: Path) -> frozenset[str]:
+    """Extract all unique domains from HTTP(S) URLs in a skill's files."""
+    found: set[str] = set()
+    scan_dir = skill_path if skill_path.is_dir() else skill_path.parent
+    for f in scan_dir.rglob("*"):
+        if not f.is_file() or f.suffix not in (".md", ".txt", ".yaml", ".yml", ".json"):
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for url_match in _URL_RE.findall(text):
+            url_clean = url_match.rstrip(".,;:")
+            # Skip template variables (e.g., ${BucketName})
+            if "${" in url_clean:
+                continue
+            try:
+                hostname = urlparse(url_clean).hostname
+                if hostname and len(hostname) > 1 and "." in hostname:
+                    found.add(hostname.lower())
+            except Exception:
+                continue
+    return frozenset(found)
+
 
 @dataclass
 class ScanResult:
@@ -66,21 +146,36 @@ class ScanResult:
     labels: List[dict] = field(default_factory=list)
     error: Optional[dict] = None
     servers_found: int = 0
+    allowed_codes: frozenset = field(default_factory=frozenset)
+    allowed_domains: frozenset = field(default_factory=frozenset)
+    placeholder_domains: frozenset = field(default_factory=frozenset)
+    file_domains: frozenset = field(default_factory=frozenset)
+    uncensored_domains: frozenset = field(default_factory=frozenset)
+
+    def _is_informational(self, code: str) -> bool:
+        if code in INFORMATIONAL_CODES:
+            return True
+        if code not in self.allowed_codes:
+            return False
+        # Code is allowed — but check domain census
+        if self.uncensored_domains:
+            return False  # New domains found → do NOT suppress
+        return True
 
     @property
     def has_critical_issues(self) -> bool:
         return any(
-            i.get("code", "") not in INFORMATIONAL_CODES
+            not self._is_informational(i.get("code", ""))
             for i in self.issues
         )
 
     @property
     def security_issues(self) -> List[dict]:
-        return [i for i in self.issues if i.get("code", "") not in INFORMATIONAL_CODES]
+        return [i for i in self.issues if not self._is_informational(i.get("code", ""))]
 
     @property
     def info_issues(self) -> List[dict]:
-        return [i for i in self.issues if i.get("code", "") in INFORMATIONAL_CODES]
+        return [i for i in self.issues if self._is_informational(i.get("code", ""))]
 
 
 def find_repo_root() -> Path:
@@ -365,11 +460,16 @@ def print_scan_result(result: ScanResult, verbose: bool = False) -> None:
             code = issue.get("code", "???")
             msg = issue.get("message", "No description")
             print(f"  {RED}✗ FAIL{NC}  [{code}] {msg}")
+        if result.uncensored_domains:
+            domains_str = ", ".join(sorted(result.uncensored_domains))
+            print(f"  {YELLOW}       ↳ Uncensored domain(s): {domains_str}{NC}")
+            print(f"  {YELLOW}       ↳ Add to mcp-scan-allowlist.json to suppress{NC}")
     elif info_issues and verbose:
         for issue in info_issues:
             code = issue.get("code", "???")
             msg = issue.get("message", "No description")
-            print(f"  {CYAN}ℹ INFO{NC}  [{code}] {msg}")
+            suffix = " (allowed)" if code in result.allowed_codes else ""
+            print(f"  {CYAN}ℹ INFO{NC}  [{code}] {msg}{suffix}")
     else:
         print(f"  {GREEN}✓ PASS{NC}")
 
@@ -438,6 +538,9 @@ def main() -> int:
     repo_root = find_repo_root()
     print(f"Repository: {repo_root}\n")
 
+    # Load per-component allowlist
+    code_allowlist, domain_allowlist, placeholder_domains = _load_allowlist(repo_root)
+
     # Find skill directories and rule files
     if args.changed:
         skill_dirs = find_changed_skill_directories(repo_root, args.base)
@@ -489,6 +592,24 @@ def main() -> int:
             scanned_rule_dirs.add(rule_dir)
 
         scan_result = scan_single_component(scan_path, comp_type, runner, args.verbose)
+
+        # Apply per-component allowlist with domain validation
+        rel_str = str(rel_path).replace("\\", "/").rstrip("/")
+        if rel_str in code_allowlist:
+            scan_result.allowed_codes = code_allowlist[rel_str]
+            scan_result.allowed_domains = domain_allowlist.get(rel_str, frozenset())
+            scan_result.placeholder_domains = placeholder_domains
+
+            # Extract domains from skill files and check against census
+            file_domains = _extract_domains_from_files(scan_path)
+            real_domains = frozenset(
+                d for d in file_domains
+                if d not in placeholder_domains
+                and not any(d.endswith("." + p) for p in placeholder_domains)
+            )
+            scan_result.file_domains = real_domains
+            scan_result.uncensored_domains = real_domains - scan_result.allowed_domains
+
         results.append(scan_result)
 
         print_scan_result(scan_result, args.verbose)

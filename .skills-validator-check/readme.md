@@ -144,8 +144,70 @@ Security scans run automatically via GitHub Actions (`.github/workflows/security
 | 1 | Critical security issues found |
 | 2 | System error (mcp-scan unavailable) |
 
+### Per-Component Allowlist (False Positive Suppression)
+
+Some skills legitimately reference external content (e.g., RAG patterns, MCP server integrations, messaging queues). These trigger W011/W012 warnings that are false positives. The allowlist file `.skills-validator-check/mcp-scan-allowlist.json` provides **granular, per-component suppression** with **domain census validation**.
+
+#### How It Works
+
+1. Each allowlisted component specifies which warning codes (e.g., `W011`, `W012`) to suppress
+2. Each component also declares the **external domains** it references
+3. During the scan, the checker extracts all HTTP(S) URLs from the skill's files
+4. If a skill references a domain **not listed** in the allowlist, the warning is **NOT suppressed** and the check fails
+5. Placeholder domains (`localhost`, `example.com`, `myapp.com`, etc.) are automatically excluded from validation
+
+#### Allowlist Entry Format
+
+```json
+{
+  "path": "plugins/developer-kit-java/skills/qdrant",
+  "allow": ["W011"],
+  "domains": [
+    "github.com",
+    "qdrant.tech",
+    "langchain4j.dev"
+  ],
+  "reason": "Qdrant RAG skill teaches document ingestion into vector stores."
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `path` | Component path relative to repo root |
+| `allow` | Warning codes to suppress (e.g., `W011`, `W012`) |
+| `domains` | Censused external domains — new domains cause the check to fail |
+| `reason` | Justification for why the warning is a false positive |
+
+#### Adding a New Allowlist Entry
+
+When a skill legitimately triggers W011/W012:
+
+1. **Verify** the warning is a genuine false positive (the skill is documentation, not executable code)
+2. **Collect domains** — extract all external URLs from the skill files:
+   ```bash
+   grep -roh 'https\?://[^ "'\''<>)}\]*' plugins/your-plugin/skills/your-skill/ | sort -u
+   ```
+3. **Add the entry** to `mcp-scan-allowlist.json` with the component path, allowed codes, domains, and reason
+4. **Run the scan** to verify:
+   ```bash
+   python3 .skills-validator-check/validators/mcp_scan_checker.py --path plugins/your-plugin/skills/your-skill -v
+   ```
+
+#### Domain Census: Why It Matters
+
+If someone modifies an allowlisted skill and adds a reference to a new external domain (e.g., `https://untrusted-site.com`), the domain won't be in the census. The checker will detect the uncensored domain and **refuse to suppress** the warning, causing the check to fail with a clear message:
+
+```
+✗ FAIL  [W011] Third-party content exposure detected
+       ↳ Uncensored domain(s): untrusted-site.com
+       ↳ Add to mcp-scan-allowlist.json to suppress
+```
+
+This ensures that every external domain referenced by an allowlisted skill is explicitly reviewed and approved.
+
 ### Known Limitations
 
 - Requires `uvx` or `pipx` to run mcp-scan
-- Scan timeout is set to 5 minutes
-- False positives should be documented in issue tracker
+- Scan timeout is set to 2 minutes per component
+- URL extraction covers `.md`, `.txt`, `.yaml`, `.yml`, `.json` files only
+- Template variables (`${...}`) in URLs are automatically excluded from domain extraction
