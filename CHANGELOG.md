@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-03-01
+
+### Changed
+
+- **Plugin Manifest Cleanup**: Removed `rules` field from plugin.json files (`developer-kit-java`, `developer-kit-php`, `developer-kit-python`, `developer-kit-typescript`) as not yet supported by Anthropic
+- **Marketplace Update**: Added missing `developer-kit-tools` plugin to marketplace.json
+
+## [2.4.0] - 2026-02-28
+
 ### Added
 
 - **New TypeScript Code Review Skills** (`developer-kit-typescript`):

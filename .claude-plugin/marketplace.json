@@ -1,6 +1,6 @@
 {
   "name": "developer-kit",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Modular marketplace for developer kit plugins",
   "owner": {
     "name": "Giuseppe Trisciuoglio",
@@ -65,6 +65,12 @@
       "name": "github-spec-kit",
       "description": "GitHub specification integration and verification",
       "source": "./plugins/github-spec-kit",
+      "version": "2.4.0"
+    },
+    {
+      "name": "developer-kit-tools",
+      "description": "External tools integration skills for CLI utilities, APIs, and third-party services",
+      "source": "./plugins/developer-kit-tools",
       "version": "2.4.0"
     }
   ]
